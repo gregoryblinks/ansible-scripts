@@ -1,5 +1,5 @@
 ---
-- name: Remove old Oracle home safely (production-safe)
+- name: Remove old Oracle home safely
   hosts: all
   become: true
   gather_facts: false
