@@ -1,0 +1,241 @@
+---
+# ============================================
+# Play: Remove old Oracle Home safely
+# ============================================
+- name: Remove old Oracle home safely (production-safe)
+
+  # Run on all targeted hosts (can be limited with -l)
+  hosts: all
+
+  # Use privilege escalation (run as root)
+  become: true
+
+  # Skip fact gathering (faster, not needed here)
+  gather_facts: false
+
+
+  # ============================================
+  # Prompt user for input
+  # ============================================
+  vars_prompt:
+
+    - name: old_home
+      # Ask user to input FULL Oracle Home path
+      prompt: "Enter FULL Oracle Home path (e.g. /u01/app/oracle/product/19.26.0.0_250121/dbhome_1)"
+      private: no   # show typed input (not hidden)
+
+
+  tasks:
+
+    # ============================================
+    # Validate input
+    # ============================================
+    - name: Ensure old_home was provided
+      assert:
+        that:
+          # Check that input is not empty
+          - old_home | length > 0
+        fail_msg: "You must enter a valid Oracle Home path"
+      # If user presses ENTER without value → playbook stops
+
+
+    # ============================================
+    # Check if directory exists
+    # ============================================
+    - name: Check old_home exists
+      stat:
+        # Check filesystem path
+        path: "{{ old_home }}"
+      register: old_home_stat
+      # Result stored in old_home_stat.stat.exists (true/false)
+
+    - name: Fail if old_home does not exist
+      fail:
+        msg: "old_home {{ old_home }} does not exist"
+      when: not old_home_stat.stat.exists
+      # If directory does NOT exist → STOP execution
+
+
+    # ============================================
+    # Detect if it's GI or DB home
+    # ============================================
+    - name: Detect GI marker (crsctl)
+      stat:
+        # Check if crsctl binary exists
+        path: "{{ old_home }}/bin/crsctl"
+      register: crsctl_stat
+
+      # Why:
+      # - Grid Infrastructure (GI) homes contain crsctl
+      # - DB homes do NOT
+
+    - name: Set home type and execution user
+      set_fact:
+        # If crsctl exists → it's a GI home
+        home_type: "{{ 'GI' if crsctl_stat.stat.exists else 'RDBMS' }}"
+
+        # Decide which OS user should run commands
+        exec_user: "{{ 'grid' if crsctl_stat.stat.exists else 'oracle' }}"
+
+      # Result:
+      # GI  → run as grid user
+      # DB  → run as oracle user
+
+
+    - name: Show detected home details
+      debug:
+        msg:
+          - "Home: {{ old_home }}"
+          - "Type: {{ home_type }}"
+          - "Run as: {{ exec_user }}"
+      # Prints info for visibility/debugging
+
+
+    # ============================================
+    # PRECHECK: Is home in use (process check)
+    # ============================================
+    - name: Check if home is in use (process check)
+      shell: |
+        ps -ef | grep -F "{{ old_home }}" | grep -v grep
+
+      # What this does:
+      # ps -ef           → list all processes
+      # grep old_home    → find processes using this path
+      # grep -v grep     → remove grep itself
+
+      register: home_usage
+
+      changed_when: false
+      # This task does NOT change system state
+
+
+    - name: Fail if home is in use
+      fail:
+        msg: "Oracle Home is currently in use! Stop DB/CRS before removal."
+      when: home_usage.stdout | length > 0
+
+      # If ANY process is using this Oracle Home → STOP
+      # Prevents deleting active DB, listener, or binaries
+
+
+    # ============================================
+    # PRECHECK: CRS dependency (only for GI)
+    # ============================================
+    - name: Check CRS resources using this home
+      become_user: grid
+      shell: |
+        crsctl stat res -t | grep -i "{{ old_home }}" || true
+
+      # What this does:
+      # crsctl stat res -t → shows cluster resources
+      # grep old_home      → check if any resource uses this home
+      # || true            → prevent failure if nothing found
+
+      register: crs_usage
+      changed_when: false
+
+      when: home_type == "GI"
+      # Only run for Grid homes
+
+
+    - name: Fail if CRS resources depend on this home
+      fail:
+        msg: "CRS resources are still using this home! Clean up CRS before removal."
+      when:
+        - home_type == "GI"
+        - crs_usage.stdout | length > 0
+
+      # If CRS still references this home → STOP
+      # Prevents breaking RAC / Clusterware
+
+
+    # ============================================
+    # DETACH Oracle Home from inventory
+    # ============================================
+    - name: Detach old home from inventory
+      become_user: "{{ exec_user }}"
+
+      command: >
+        {{ old_home }}/oui/bin/runInstaller
+        -detachHome
+        -silent
+        -local
+        ORACLE_HOME={{ old_home }}
+
+      # This runs:
+      # runInstaller -detachHome
+
+      # What it does internally:
+      # Updates central inventory:
+      # /u01/app/oraInventory/ContentsXML/inventory.xml
+      # Marks home as:
+      # REMOVED="T"
+
+      register: detach_result
+
+
+    - name: Show detach output
+      debug:
+        var: detach_result.stdout_lines
+      # Displays Oracle installer output
+
+
+    # ============================================
+    # VERIFY inventory cleanup
+    # ============================================
+    - name: Check inventory.xml for this home
+      shell: |
+        grep -i "{{ old_home }}" /u01/app/oraInventory/ContentsXML/inventory.xml || true
+
+      # Searches inventory.xml for this home entry
+
+      register: inventory_check
+
+
+    - name: Assert home is marked REMOVED
+      assert:
+        that:
+          - "'REMOVED=\"T\"' in inventory_check.stdout"
+
+        fail_msg: "Home NOT properly detached in inventory!"
+        success_msg: "Home successfully marked as REMOVED"
+
+      # Ensures Oracle marked home correctly
+      # If not → STOP (do NOT delete files)
+
+
+    # ============================================
+    # DELETE Oracle Home directory
+    # ============================================
+    - name: Remove old home directory
+      file:
+        path: "{{ old_home }}"
+        state: absent
+
+      # Equivalent to:
+      # rm -rf {{ old_home }}
+
+      # Safe because:
+      # - Only runs AFTER detach + validation
+      # - Path was verified earlier
+
+
+    # ============================================
+    # FINAL VALIDATION
+    # ============================================
+    - name: Final inventory check for leftovers
+      shell: |
+        grep -i "{{ old_home }}" /u01/app/oraInventory/ContentsXML/inventory.xml || true
+
+      # Double-check if anything still references this home
+
+      register: final_inventory
+
+
+    - name: Show remaining inventory entries
+      debug:
+        var: final_inventory.stdout
+
+      # Output:
+      # - Empty → clean removal
+      # - Not empty → something still references it
