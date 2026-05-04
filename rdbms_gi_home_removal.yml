@@ -3,14 +3,42 @@
   hosts: all
   become: true
   gather_facts: false
- 
+
   vars_prompt:
-    - name: old_home
-      prompt: "Enter FULL Oracle Home path (e.g. /u01/app/oracle/product/19.26.0.0_250121/dbhome_1)"
+    - name: dbhome_name
+      prompt: "Enter DB home name (e.g. dbhome_1) or leave blank"
       private: no
- 
+      default: ""
+
+    - name: db_version
+      prompt: "Enter DB version (e.g. 19.26.0.0_250121) or leave blank"
+      private: no
+      default: ""
+
+    - name: gi_version
+      prompt: "Enter GI version (e.g. 19.26.0.0) or leave blank"
+      private: no
+      default: ""
+
+  vars:
+    homes_to_process: >-
+      {{
+        []
+        + ([ "/u01/app/oracle/product/" ~ db_version ~ "/" ~ dbhome_name ]
+           if dbhome_name|length > 0 and db_version|length > 0 else [])
+        + ([ "/u01/app/" ~ gi_version ~ "/grid" ]
+           if gi_version|length > 0 else [])
+      }}
+
   tasks:
- 
+
+    - name: Loop through homes and execute original logic
+      block:
+
+        - name: Set current home
+          set_fact:
+            old_home: "{{ item }}"
+
     # -----------------------------------
     # Validate input
     # -----------------------------------
